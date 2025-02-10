@@ -138,7 +138,7 @@ namespace OpenHardwareMonitorJsonServer
             }
 
 
-            var isConsole = GetBoolArgValue(args, "--console", true);
+            var isConsole = GetBoolArgValue(args, "--console", false);
             var isGroup = GetBoolArgValue(args, "--group", true);
             // 默认硬件监控设置
             var mainboardEnabled = GetBoolArgValue(args, "--mainboard", true);
@@ -159,8 +159,15 @@ namespace OpenHardwareMonitorJsonServer
                 HDDEnabled = true,
             };
 
-            // 如果提供了端口则说明需要开启服务器
-            if (port >= 0)
+            
+            if (isConsole)  // 是否控制台输出 JSON
+            {
+                // 初始化硬件传感器（类似于打开设备资源）
+                computer.Open();
+                // 如果不开启服务器则返回内容
+                Console.WriteLine(getHardware(computer, new Visitor(), isGroup));
+            }
+            else if (port >= 0) // 如果提供了端口则说明需要开启服务器
             {
                 Console.Write("初始化硬件传感器...");
                 // 初始化硬件传感器（类似于打开设备资源）
@@ -168,13 +175,6 @@ namespace OpenHardwareMonitorJsonServer
                 Console.Write(" OK\n");
                 // 启动 HTTP 服务器，监听传入的请求
                 Task.Run(() => StartServer(computer, port, isGroup)).Wait();
-            }
-            else if (isConsole)  // 是否控制台输出 JSON
-            {
-                // 初始化硬件传感器（类似于打开设备资源）
-                computer.Open();
-                // 如果不开启服务器则返回内容
-                Console.WriteLine(getHardware(computer, new Visitor(), isGroup));
             }
             else {
                 Console.WriteLine("输入 Help 来获取帮助");
