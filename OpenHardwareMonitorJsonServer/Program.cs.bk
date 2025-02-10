@@ -1,0 +1,208 @@
+﻿using Newtonsoft.Json;
+using Newtonsoft.Json.Serialization;
+using OpenHardwareMonitor.Hardware;
+using System;
+using System.Net;
+using System.Text;
+using System.Reflection;
+using System.Linq;
+
+namespace OpenHardwareMonitorJsonServer
+{
+    // 这是从 OpenHardwareMonitor 的 GUI 项目中复制粘贴的 Visitor 类
+    // 用于遍历计算机硬件树的访问者（Visitor）模式实现
+    class Visitor : IVisitor
+    {
+        // 访问整个计算机节点，遍历所有硬件
+        public void VisitComputer(IComputer computer)
+        {
+            // 调用 Traverse 方法（类似于递归遍历），传入当前的 Visitor 实例
+            computer.Traverse(this);
+        }
+
+        // 访问单个硬件节点
+        public void VisitHardware(IHardware hardware)
+        {
+            // 更新硬件状态，类似于刷新或采集最新数据
+            hardware.Update();
+
+            // 遍历该硬件的所有子硬件（例如：主板上的多个芯片）
+            foreach (IHardware subHardware in hardware.SubHardware)
+            {
+                // 对每个子硬件继续应用 Visitor 模式
+                subHardware.Accept(this);
+            }
+        }
+
+        // 对于参数节点不做任何处理
+        public void VisitParameter(IParameter parameter) { }
+
+        // 对于传感器节点不做任何处理
+        public void VisitSensor(ISensor sensor) { }
+    }
+
+    // Json.NET 自定义转换器，用于将对象转换为其 ToString() 返回的字符串
+    // 对于 Java 开发者来说，这类似于重写对象的 toString() 方法用于 JSON 输出
+    class ToStringJsonConverter : JsonConverter
+    {
+        // 这里简单返回 true，表示可以转换任何类型
+        public override bool CanConvert(Type objectType)
+        {
+            return true;
+        }
+
+        // 反序列化时不实现该方法（此示例仅用于序列化输出）
+        public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
+        {
+            throw new NotImplementedException();
+        }
+
+        // 将对象转换为字符串后写入 JSON 输出
+        public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+        {
+            writer.WriteValue(value.ToString());
+        }
+    }
+
+    // Json.NET 自定义合约解析器
+    // 用于定制 JSON 序列化的行为，由于无法修改已编译库的属性注解，所以采用这种方式
+    class CustomContractResolver : DefaultContractResolver
+    {
+        // 重写属性创建方法，可以控制哪些属性被序列化
+        protected override JsonProperty CreateProperty(MemberInfo member, MemberSerialization memberSerialization)
+        {
+            // 调用父类方法创建 JsonProperty 对象
+            JsonProperty property = base.CreateProperty(member, memberSerialization);
+
+            // 不序列化 Values 或 Parameters 属性
+            // Values 属性包含过去24小时所有传感器的读数，数据量可能非常大
+            // Parameters 属性仅包含计算 Value 属性的说明字符串，通常不需要输出
+            if (property.PropertyName == "Values" || property.PropertyName == "Parameters")
+            {
+                // 设置序列化时跳过该属性
+                property.ShouldSerialize = (x) => false;
+            }
+
+            return property;
+        }
+
+        // 重写对象合约创建方法，可对整个对象应用自定义转换器
+        protected override JsonObjectContract CreateObjectContract(Type objectType)
+        {
+            JsonObjectContract contract = base.CreateObjectContract(objectType);
+            // 如果对象类型为 OpenHardwareMonitor.Hardware.Identifier，则使用自定义的 ToStringJsonConverter
+            // 否则，默认序列化会将其视为空对象（因为没有公共属性），输出类似 "Identifier: {}"
+            if (objectType == typeof(Identifier))
+            {
+                contract.Converter = new ToStringJsonConverter();
+            }
+
+            return contract;
+        }
+    }
+
+    class Program
+    {
+        public static void Main(string[] args)
+        {
+            // 创建一个 Computer 实例，并启用所有硬件监控传感器
+            var computer = new Computer()
+            {
+                MainboardEnabled = true,
+                CPUEnabled = true,
+                RAMEnabled = true,
+                GPUEnabled = true,
+                FanControllerEnabled = true,
+                HDDEnabled = true,
+            };
+
+            // 初始化硬件传感器（类似于打开设备资源）
+            computer.Open();
+
+            // 处理参数
+            var port = 8080;
+            // 检查是否提供了 -p 或 --port 参数
+            var portArg = args.FirstOrDefault(arg => arg.StartsWith("-p") || arg.StartsWith("--port"));
+            if (portArg != null)
+            {
+                // 尝试解析跟在 -p 或 --port 后面的端口号
+                var portValue = args.SkipWhile(arg => arg != portArg).Skip(1).FirstOrDefault();
+                if (!string.IsNullOrEmpty(portValue) && int.TryParse(portValue, out int providedPort))
+                {
+                    port = providedPort;
+                }
+                else if (portArg.Length > 3) // 如果是 --port=1234 这种形式
+                {
+                    string portStr = portArg.Substring(portArg.IndexOf('=') + 1);
+                    if (int.TryParse(portStr, out int providedPortShortForm))
+                    {
+                        port = providedPortShortForm;
+                    }
+                }
+            }
+
+            // 在单独的线程上启动 HTTP 服务器，监听传入的请求
+            StartServer(computer, port);
+
+            Console.WriteLine($"监听地址: http://localhost:{port}");
+            Console.WriteLine("按回车退出...");
+            Console.ReadLine();
+        }
+
+        // 异步启动 HTTP 服务器的方法
+        // 对于熟悉 Java 的开发者，这类似于使用 NIO 或基于回调的服务器实现
+        private async static void StartServer(Computer computer, int port)
+        {
+            // 创建一个 Visitor 实例，用于更新硬件数据
+            var visitor = new Visitor();
+
+            // 创建 HTTP 服务器监听器，监听本地 8080 端口
+            var listener = new HttpListener();
+            listener.Prefixes.Add($"http://+:{port}/");
+            listener.Start();
+
+            // 当服务器处于监听状态时，持续等待并处理请求
+            while (listener.IsListening)
+            {
+                // 异步等待客户端请求（类似于 Java 的异步 I/O）
+                var context = await listener.GetContextAsync();
+
+                // 通过 Visitor 模式更新所有硬件传感器数据
+                computer.Accept(visitor);
+
+                // 将 computer.Hardware 的数据序列化为 JSON 字符串
+                // 这里设置了 ReferenceLoopHandling.Ignore 来忽略循环引用，
+                // 循环引用通常是因为硬件节点中包含对父节点的引用
+                // TODO: 可在序列化前清理数据，目前数据中包含一些多余的信息
+                var settings = new JsonSerializerSettings()
+                {
+                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
+                    ContractResolver = new CustomContractResolver()
+                };
+                var data = JsonConvert.SerializeObject(computer.Hardware, settings);
+
+                // 将 JSON 数据转换为 UTF-8 编码的字节数组
+                var buffer = Encoding.UTF8.GetBytes(data);
+                var response = context.Response;
+
+                try
+                {
+                    // 设置跨域访问头，允许任意域访问（对于前端跨域调用很有用）
+                    response.AddHeader("Access-Control-Allow-Origin", "*");
+                    // 指定内容类型为 JSON
+                    response.AddHeader("Content-Type", "application/json");
+                    // 将序列化的 JSON 数据写入响应流
+                    response.OutputStream.Write(buffer, 0, buffer.Length);
+                }
+                catch (HttpListenerException)
+                {
+                    // 捕获 HttpListenerException 异常，不做处理
+                    // 这通常是由于客户端提前关闭了连接，写入已关闭的流会引发异常
+                }
+
+                // 关闭响应流，释放资源
+                response.OutputStream.Close();
+            }
+        }
+    }
+}

@@ -87,6 +87,7 @@
     </None>
   </ItemGroup>
   <ItemGroup>
+    <Content Include="index1.html" />
     <Content Include="Lib\Newtonsoft.Json.dll" />
     <Content Include="Lib\OpenHardwareMonitorLib.dll" />
   </ItemGroup>
