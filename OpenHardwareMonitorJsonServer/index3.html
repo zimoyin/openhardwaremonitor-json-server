@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>硬件传感器数据图表</title>
+  <!-- 引入 Bootstrap CSS 用于页面美化 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      padding: 20px;
+      background-color: #f8f9fa;
+    }
+    .card {
+      margin-bottom: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .card-header {
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1 class="mb-4">硬件传感器数据图表</h1>
+    
+    <!-- CPU 频率图 -->
+    <div class="card mb-3">
+      <div class="card-header">CPU 频率 (实时 0-5分钟)</div>
+      <div class="card-body">
+        <canvas id="cpuFreqChart"></canvas>
+      </div>
+    </div>
+    
+    <!-- CPU 负载图（动态获取所有核心负载） -->
+    <div class="card mb-3">
+      <div class="card-header">CPU 负载 (各核心, 实时 0-5分钟)</div>
+      <div class="card-body">
+        <canvas id="cpuLoadChart"></canvas>
+      </div>
+    </div>
+    
+    <!-- 温度图（合并 CPU 与 GPU 温度） -->
+    <div class="card mb-3">
+      <div class="card-header">温度 (CPU &amp; GPU, 实时 0-5分钟)</div>
+      <div class="card-body">
+        <canvas id="tempChart"></canvas>
+      </div>
+    </div>
+    
+    <!-- HDD 与内存图放在同一行 -->
+    <div class="row">
+      <!-- 硬盘使用情况饼图 -->
+      <div class="col-md-6">
+        <div class="card mb-3">
+          <div class="card-header">硬盘使用情况</div>
+          <div class="card-body">
+            <canvas id="hddUsageChart"></canvas>
+          </div>
+        </div>
+      </div>
+      <!-- 内存使用情况饼图 -->
+      <div class="col-md-6">
+        <div class="card mb-3">
+          <div class="card-header">内存使用情况</div>
+          <div class="card-body">
+            <canvas id="ramUsagePieChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+  </div>
+  
+  <!-- 引入 Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    // 全局历史数据数组（以秒为单位）
+    let timeHistory = [];        // 记录采集时间（秒）
+    let cpuFreqHistory = [];     // CPU 频率数据
+    let cpuTempHistory = [];     // CPU 温度数据
+    let gpuFreqHistory = [];     // GPU 频率数据
+    let gpuTempHistory = [];     // GPU 温度数据
+    // 用于记录 CPU 负载数据，动态保存各核心数据（键为传感器名称，值为数组）
+    let cpuLoadHistory = {};
+
+    // 窗口大小：5分钟 = 300秒
+    const windowSeconds = 300;
+    
+    // 页面启动时间（毫秒）
+    let startTime = Date.now();
+    
+    // 图表实例
+    let cpuFreqChart, cpuLoadChart, gpuFreqChart, tempChart, hddUsageChart, ramUsagePieChart;
+    
+    // 辅助函数：生成颜色，根据 index 返回预定义颜色（可调整透明度）
+    function getColor(index, opacity=1) {
+      const colors = [
+         'rgba(255, 99, 132, OPACITY)',
+         'rgba(54, 162, 235, OPACITY)',
+         'rgba(255, 206, 86, OPACITY)',
+         'rgba(75, 192, 192, OPACITY)',
+         'rgba(153, 102, 255, OPACITY)',
+         'rgba(255, 159, 64, OPACITY)'
+      ];
+      return colors[index % colors.length].replace('OPACITY', opacity);
+    }
+    
+    // 移除超过窗口范围的数据（只保留最近300秒），同时同步移除 cpuLoadHistory 各核心数组的首元素
+    function removeOldData() {
+      if(timeHistory.length === 0) return;
+      const current = timeHistory[timeHistory.length - 1];
+      while(timeHistory.length > 0 && current - timeHistory[0] > windowSeconds) {
+        timeHistory.shift();
+        cpuFreqHistory.shift();
+        cpuTempHistory.shift();
+        gpuFreqHistory.shift();
+        gpuTempHistory.shift();
+        for (let key in cpuLoadHistory) {
+          cpuLoadHistory[key].shift();
+        }
+      }
+    }
+    
+    // 更新图表 x 轴：若运行时间不足 60 秒，则显示 0-60 (秒)；否则显示最近300秒，并按分钟显示标签
+    function updateTimeAxis(chart) {
+      if (!chart || timeHistory.length === 0) return;
+      const current = timeHistory[timeHistory.length - 1];
+      if (current < 60) {
+        chart.options.scales.x.min = 0;
+        chart.options.scales.x.max = 60;
+        chart.options.scales.x.ticks.callback = value => value + "s";
+        chart.options.scales.x.title.text = "时间 (秒)";
+      } else {
+        chart.options.scales.x.min = current - windowSeconds;
+        chart.options.scales.x.max = current;
+        chart.options.scales.x.ticks.callback = value => (value / 60).toFixed(1) + "m";
+        chart.options.scales.x.title.text = "时间 (分钟)";
+      }
+    }
+    
+    async function fetchDataAndRenderCharts() {
+      try {
+        const response = await fetch('http://127.0.0.1:8080/');
+        const data = await response.json();
+        const now = Date.now();
+        // 计算经过的秒数（浮点数）
+        const elapsed = (now - startTime) / 1000;
+        timeHistory.push(elapsed);
+    
+        // —— CPU 数据 ——
+        const cpu = data.CPU[0];
+        // CPU负载：动态获取所有核心负载 (SensorType === 3 且名称以 "CPU Core" 开头)
+        const cpuLoadSensors = cpu.Sensors.filter(s => s.SensorType === 3 && s.Name.startsWith("CPU Core"));
+        cpuLoadSensors.forEach(sensor => {
+          const key = sensor.Name;  // 例如 "CPU Core #1"
+          if (!cpuLoadHistory[key]) {
+            cpuLoadHistory[key] = [];
+          }
+          cpuLoadHistory[key].push(sensor.Value);
+        });
+        // CPU频率：  传感器数据（单位 MHz），确保正确
+        cpuFreqHistory.push(cpu.TimeStampCounterFrequency);
+        // CPU温度：选取 SensorType 为 2 且 Identifier 包含 "/temperature/"
+        const cpuTempSensor = cpu.Sensors.find(s => s.SensorType === 2 && s.Identifier.includes('/temperature/'));
+        const cpuTemp = cpuTempSensor ? cpuTempSensor.Value : 0;
+        cpuTempHistory.push(cpuTemp);
+    
+        // —— GPU 数据 ——
+        const gpu = data.GpuNvidia[0];
+        // GPU频率：选取 SensorType 为 1 且 Identifier 包含 "/clock/0"（一般为 GPU Core 频率）
+        const gpuFreqSensor = gpu.Sensors.find(s => s.SensorType === 1 && s.Identifier.includes('/clock/0'));
+        const gpuFreq = gpuFreqSensor ? gpuFreqSensor.Value : 0;
+        gpuFreqHistory.push(gpuFreq);
+        // GPU温度：选取 SensorType 为 2 且 Identifier 包含 "/temperature/"
+        const gpuTempSensor = gpu.Sensors.find(s => s.SensorType === 2 && s.Identifier.includes('/temperature/'));
+        const gpuTemp = gpuTempSensor ? gpuTempSensor.Value : 0;
+        gpuTempHistory.push(gpuTemp);
+    
+        // —— HDD 数据（即时数据） ——
+        const hddData = data.HDD;
+        const hddLabels = hddData.map((disk, idx) => `HDD ${idx+1}`);
+        const hddValues = hddData.map(disk => {
+          const sensor = disk.Sensors.find(s => s.Name === "Used Space");
+          return sensor ? sensor.Value : 0;
+        });
+    
+        // —— 内存数据（即时数据） ——
+        const ram = data.RAM[0];
+        const usedMemorySensor = ram.Sensors.find(s => s.Name === "Used Memory");
+        const availableMemorySensor = ram.Sensors.find(s => s.Name === "Available Memory");
+        const usedMemory = usedMemorySensor ? usedMemorySensor.Value : 0;
+        const availableMemory = availableMemorySensor ? availableMemorySensor.Value : 0;
+    
+        // 移除超过 300 秒的数据
+        removeOldData();
+    
+        // 1. 更新 CPU 频率图（纯频率数据），y轴固定为 0～3800 MHz
+        if (cpuFreqChart) {
+          cpuFreqChart.data.labels = timeHistory;
+          cpuFreqChart.data.datasets[0].data = cpuFreqHistory;
+          cpuFreqChart.data.datasets[1].data = gpuFreqHistory;
+          updateTimeAxis(cpuFreqChart);
+          cpuFreqChart.update();
+        } else {
+          const ctx = document.getElementById('cpuFreqChart').getContext('2d');
+          cpuFreqChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: timeHistory,
+              datasets: [{
+                label: 'CPU 频率 (MHz)',
+                data: cpuFreqHistory,
+                borderColor: 'rgba(54, 162, 235, 1)',
+                backgroundColor: 'rgba(54, 162, 235, 0.5)',
+                fill: false,
+                tension: 0.1
+              },
+              {
+                label: 'GPU 频率 (MHz)',
+                data: gpuFreqHistory,
+                borderColor: 'rgba(75, 192, 192, 1)',
+                backgroundColor: 'rgba(75, 192, 192, 0.5)',
+                fill: false,
+                tension: 0.1
+              }
+            ]
+            },
+            options: {
+              responsive: true,
+              scales: {
+                x: {
+                  type: 'linear',
+                  min: 0,
+                  max: 60,
+                  title: { display: true, text: '时间 (秒)' }
+                },
+                y: {
+                  title: { display: true, text: '频率 (MHz)' }
+                }
+              },
+              plugins: {
+                title: { display: true, text: 'CPU/GPU 频率' }
+              }
+            }
+          });
+        }
+    
+        // 2. 更新 CPU 负载图（动态获取所有核心负载）
+        if (cpuLoadChart) {
+          cpuLoadChart.data.labels = timeHistory;
+          cpuLoadChart.data.datasets = Object.keys(cpuLoadHistory).map((key, index) => {
+            return {
+              label: key,
+              data: cpuLoadHistory[key],
+              borderColor: getColor(index),
+              backgroundColor: getColor(index, 0.5),
+              fill: false,
+              tension: 0.1
+            };
+          });
+          updateTimeAxis(cpuLoadChart);
+          cpuLoadChart.update();
+        } else {
+          const ctx = document.getElementById('cpuLoadChart').getContext('2d');
+          cpuLoadChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: timeHistory,
+              datasets: Object.keys(cpuLoadHistory).map((key, index) => {
+                return {
+                  label: key,
+                  data: cpuLoadHistory[key],
+                  borderColor: getColor(index),
+                  backgroundColor: getColor(index, 0.5),
+                  fill: false,
+                  tension: 0.1
+                };
+              })
+            },
+            options: {
+              responsive: true,
+              scales: {
+                x: {
+                  type: 'linear',
+                  min: 0,
+                  max: 60,
+                  title: { display: true, text: '时间 (秒)' }
+                },
+                y: {
+                  min: 0,
+                  title: { display: true, text: '负载 (%)' }
+                }
+              },
+              plugins: {
+                title: { display: true, text: 'CPU 负载 (各核心)' }
+              }
+            }
+          });
+        }
+  
+    
+        // 4. 更新 温度图（合并 CPU 与 GPU 温度），y轴从 0 开始
+        if (tempChart) {
+          tempChart.data.labels = timeHistory;
+          tempChart.data.datasets[0].data = cpuTempHistory;
+          tempChart.data.datasets[1].data = gpuTempHistory;
+          updateTimeAxis(tempChart);
+          tempChart.update();
+        } else {
+          const ctx = document.getElementById('tempChart').getContext('2d');
+          tempChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: timeHistory,
+              datasets: [
+                {
+                  label: 'CPU 温度 (°C)',
+                  data: cpuTempHistory,
+                  borderColor: 'rgba(255, 99, 132, 1)',
+                  backgroundColor: 'rgba(255, 99, 132, 0.5)',
+                  fill: false,
+                  tension: 0.1
+                },
+                {
+                  label: 'GPU 温度 (°C)',
+                  data: gpuTempHistory,
+                  borderColor: 'rgba(255, 159, 64, 1)',
+                  backgroundColor: 'rgba(255, 159, 64, 0.5)',
+                  fill: false,
+                  tension: 0.1
+                }
+              ]
+            },
+            options: {
+              responsive: true,
+              scales: {
+                x: {
+                  type: 'linear',
+                  min: 0,
+                  max: 60,
+                  title: { display: true, text: '时间 (秒)' }
+                },
+                y: {
+                  min: 0,
+                  title: { display: true, text: '温度 (°C)' }
+                }
+              },
+              plugins: {
+                title: { display: true, text: '温度 (CPU & GPU)' }
+              }
+            }
+          });
+        }
+    
+        // 5. 更新硬盘使用饼图（即时数据）
+        if (hddUsageChart) {
+          hddUsageChart.data.labels = hddLabels;
+          hddUsageChart.data.datasets[0].data = hddValues;
+          hddUsageChart.update();
+        } else {
+          const ctx = document.getElementById('hddUsageChart').getContext('2d');
+          hddUsageChart = new Chart(ctx, {
+            type: 'pie',
+            data: {
+              labels: hddLabels,
+              datasets: [{
+                data: hddValues,
+                backgroundColor: [
+                  'rgba(255, 99, 132, 0.5)',
+                  'rgba(54, 162, 235, 0.5)',
+                  'rgba(255, 206, 86, 0.5)',
+                  'rgba(75, 192, 192, 0.5)'
+                ],
+                borderColor: [
+                  'rgba(255, 99, 132, 1)',
+                  'rgba(54, 162, 235, 1)',
+                  'rgba(255, 206, 86, 1)',
+                  'rgba(75, 192, 192, 1)'
+                ],
+                borderWidth: 1
+              }]
+            },
+            options: {
+              responsive: true,
+              plugins: {
+                title: { display: true, text: '硬盘使用情况' }
+              }
+            }
+          });
+        }
+    
+        // 6. 更新内存使用饼图（即时数据）
+        if (ramUsagePieChart) {
+          ramUsagePieChart.data.datasets[0].data = [usedMemory, availableMemory];
+          ramUsagePieChart.update();
+        } else {
+          const ctx = document.getElementById('ramUsagePieChart').getContext('2d');
+          ramUsagePieChart = new Chart(ctx, {
+            type: 'pie',
+            data: {
+              labels: ['Used Memory (GB)', 'Available Memory (GB)'],
+              datasets: [{
+                data: [usedMemory, availableMemory],
+                backgroundColor: [
+                  'rgba(255, 99, 132, 0.5)',
+                  'rgba(75, 192, 192, 0.5)'
+                ],
+                borderColor: [
+                  'rgba(255, 99, 132, 1)',
+                  'rgba(75, 192, 192, 1)'
+                ],
+                borderWidth: 1
+              }]
+            },
+            options: {
+              responsive: true,
+              plugins: {
+                title: { display: true, text: '内存使用情况' }
+              }
+            }
+          });
+        }
+    
+      } catch (error) {
+        console.error('获取数据失败:', error);
+      }
+    }
+    
+    // 页面加载后立即开始，每秒更新一次数据
+    window.onload = () => {
+      fetchDataAndRenderCharts();
+      setInterval(fetchDataAndRenderCharts, 1000);
+    };
+  </script>
+</body>
+</html>
