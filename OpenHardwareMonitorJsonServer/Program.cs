@@ -195,7 +195,6 @@ namespace OpenHardwareMonitorJsonServer
             var arg = args.FirstOrDefault(a => a.StartsWith(argName));
             if (arg == null) return defaultValue; // 如果没有找到参数，则使用默认值
             var argValue = args.SkipWhile(a => a != arg).Skip(1).FirstOrDefault();
-            Console.WriteLine(arg+" : "+argValue);
             if (argValue=="false" || argValue == "true") // 检查是否提供了参数值
             {
                 return bool.Parse(argValue);
