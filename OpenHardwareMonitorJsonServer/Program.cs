@@ -194,11 +194,13 @@ namespace OpenHardwareMonitorJsonServer
         {
             var arg = args.FirstOrDefault(a => a.StartsWith(argName));
             if (arg == null) return defaultValue; // 如果没有找到参数，则使用默认值
-            if (arg.Length > argName.Length + 1) // 检查是否提供了参数值
+            var argValue = args.SkipWhile(a => a != arg).Skip(1).FirstOrDefault();
+            Console.WriteLine(arg+" : "+argValue);
+            if (argValue=="false" || argValue == "true") // 检查是否提供了参数值
             {
-                return bool.Parse(arg.Substring(argName.Length + 1));
+                return bool.Parse(argValue);
             }
-            return true; // 如果只提供了参数名，没有提供值，默认启用
+            return !defaultValue; // 如果只提供了参数名，没有提供值，对默认值取反
         }
 
         private static string getHardware(Computer computer, Visitor visitor, bool isGroup = true) {
